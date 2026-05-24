@@ -7,7 +7,15 @@ from sqlalchemy import pool
 
 from app.config import settings
 from app.database.base import Base
-from app.models import SystemMetric  # noqa: F401 — registers model on Base.metadata
+from app.models import (  # noqa: F401 — registers models on Base.metadata
+    AlertHistory,
+    AlertRule,
+    NetworkMetric,
+    Node,
+    ProcessMetric,
+    SystemMetric,
+    User,
+)
 
 config = context.config
 
