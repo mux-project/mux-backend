@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# env
+.env
+.env.development
+.env.production
+
+# AI Agents
+AGENTS.md

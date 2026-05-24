@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from .hello import router as hello_router
+from .system_metric import router as system_metric_router
 
 api_router = APIRouter(prefix="/api")
-api_router.include_router(hello_router)
+api_router.include_router(system_metric_router)
