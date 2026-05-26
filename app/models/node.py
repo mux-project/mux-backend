@@ -15,6 +15,9 @@ class Node(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
+    node_uuid: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), unique=True, nullable=False
+    )
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
     os_version: Mapped[str | None] = mapped_column(String(255))
