@@ -18,6 +18,7 @@ class Node(Base):
     node_uuid: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), unique=True, nullable=False
     )
+    agent_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
     ip_address: Mapped[str] = mapped_column(INET, nullable=False)
     os_version: Mapped[str | None] = mapped_column(String(255))

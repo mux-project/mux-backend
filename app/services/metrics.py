@@ -10,12 +10,17 @@ from app.models.network_metric import NetworkMetric
 from app.models.process_metric import ProcessMetric
 from app.models.system_metric import SystemMetric
 from app.schemas.metric_payload import IngestResponse, MetricPayload
+from app.services.nodes import resolve_node_uuid
 
 
 async def get_current_metrics(
     db: AsyncSession,
-    node_id: uuid.UUID | None = None,
+    node_uuid: uuid.UUID | None = None,
 ) -> list[SystemMetric]:
+    node_id = None
+    if node_uuid:
+        node_id = await resolve_node_uuid(db, node_uuid)
+
     subq = select(
         SystemMetric.node_id,
         sa_func.max(SystemMetric.collected_at).label("max_collected_at"),
@@ -39,11 +44,12 @@ async def get_current_metrics(
 
 async def get_metric_history(
     db: AsyncSession,
-    node_id: uuid.UUID,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
     interval: str,
 ) -> list[dict]:
+    node_id = await resolve_node_uuid(db, node_uuid)
     bucket = sa_func.date_trunc(interval, SystemMetric.collected_at)
     query = (
         select(
@@ -81,10 +87,11 @@ async def get_metric_history(
 
 async def get_network_metrics(
     db: AsyncSession,
-    node_id: uuid.UUID,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
 ) -> list[NetworkMetric]:
+    node_id = await resolve_node_uuid(db, node_uuid)
     query = (
         select(NetworkMetric)
         .where(
@@ -100,9 +107,10 @@ async def get_network_metrics(
 
 async def get_top_processes(
     db: AsyncSession,
-    node_id: uuid.UUID,
+    node_uuid: uuid.UUID,
     limit: int = 10,
 ) -> list[ProcessMetric]:
+    node_id = await resolve_node_uuid(db, node_uuid)
     latest = await db.scalar(
         select(sa_func.max(ProcessMetric.collected_at)).where(
             ProcessMetric.node_id == node_id
@@ -126,11 +134,12 @@ async def get_top_processes(
 
 async def export_metrics(
     db: AsyncSession,
-    node_id: uuid.UUID,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
     fmt: str = "json",
 ) -> str | list[dict]:
+    node_id = await resolve_node_uuid(db, node_uuid)
     query = (
         select(SystemMetric)
         .where(
@@ -148,8 +157,7 @@ async def export_metrics(
         writer = csv.writer(output)
         writer.writerow(
             [
-                "id",
-                "node_id",
+                "node_uuid",
                 "cpu_percent",
                 "memory_percent",
                 "memory_used_mb",
@@ -166,8 +174,7 @@ async def export_metrics(
         for r in rows:
             writer.writerow(
                 [
-                    r.id,
-                    r.node_id,
+                    str(node_uuid),
                     r.cpu_percent,
                     r.memory_percent,
                     r.memory_used_mb,
@@ -185,8 +192,7 @@ async def export_metrics(
 
     return [
         {
-            "id": r.id,
-            "node_id": str(r.node_id),
+            "node_uuid": str(node_uuid),
             "cpu_percent": r.cpu_percent,
             "memory_percent": r.memory_percent,
             "memory_used_mb": r.memory_used_mb,
@@ -207,7 +213,7 @@ async def create_metrics(
     db: AsyncSession,
     payload: MetricPayload,
 ) -> IngestResponse:
-    node_id = uuid.UUID(payload.node_id)
+    node_id = await resolve_node_uuid(db, uuid.UUID(payload.node_id))
     collected_at = payload.collected_at or datetime.now(timezone.utc)
     counts = {"system_metric": 0, "network_metrics": 0, "process_metrics": 0}
 

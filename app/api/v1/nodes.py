@@ -38,18 +38,16 @@ async def register(
     return NodeRegistrationResponse(node=node, api_key=api_key)
 
 
-@router.get("/{node_id}", response_model=NodeDetailResponse)
+@router.get("/{node_uuid}", response_model=NodeDetailResponse)
 async def get_node_detail(
-    node_id: str,
+    node_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    node, latest_metric = await get_node_with_metrics(db, nid)
+    node, latest_metric = await get_node_with_metrics(db, node_uuid)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     return NodeDetailResponse(
-        id=str(node.id),
-        node_uuid=str(node.node_uuid),
+        node_uuid=node.node_uuid,
         hostname=node.hostname,
         ip_address=node.ip_address,
         os_version=node.os_version,
@@ -63,25 +61,23 @@ async def get_node_detail(
     )
 
 
-@router.delete("/{node_id}", response_model=NodeDeleteResponse)
+@router.delete("/{node_uuid}", response_model=NodeDeleteResponse)
 async def deregister(
-    node_id: str,
+    node_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    ok = await deregister_node(db, nid)
+    ok = await deregister_node(db, node_uuid)
     if not ok:
         raise HTTPException(status_code=404, detail="Node not found")
     return NodeDeleteResponse()
 
 
-@router.post("/{node_id}/heartbeat", response_model=NodeHeartbeatResponse)
+@router.post("/{node_uuid}/heartbeat", response_model=NodeHeartbeatResponse)
 async def node_heartbeat(
-    node_id: str,
+    node_uuid: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    ok = await heartbeat(db, nid)
+    ok = await heartbeat(db, node_uuid)
     if not ok:
         raise HTTPException(status_code=404, detail="Node not found")
     return NodeHeartbeatResponse()

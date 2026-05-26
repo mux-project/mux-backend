@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class NodeCreate(BaseModel):
-    node_uuid: uuid.UUID
+    agent_id: str
     hostname: str
     ip_address: str
     os_version: str | None = None
@@ -15,7 +15,6 @@ class NodeCreate(BaseModel):
 class NodeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
     node_uuid: uuid.UUID
     hostname: str
     ip_address: str
@@ -54,7 +53,6 @@ class LatestMetricSnapshot(BaseModel):
 
 
 class NodeDetailResponse(BaseModel):
-    id: str
     node_uuid: uuid.UUID
     hostname: str
     ip_address: str

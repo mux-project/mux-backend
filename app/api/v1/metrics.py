@@ -31,57 +31,51 @@ async def ingest_metric(
 
 @router.get("/current")
 async def current_metrics(
-    node_id: str | None = Query(None),
+    node_uuid: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id) if node_id else None
-    metrics = await get_current_metrics(db, nid)
-    return metrics
+    return await get_current_metrics(db, node_uuid)
 
 
 @router.get("/history")
 async def metric_history(
-    node_id: str,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
     interval: str = Query("1 hour"),
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    return await get_metric_history(db, nid, start, end, interval)
+    return await get_metric_history(db, node_uuid, start, end, interval)
 
 
 @router.get("/network", response_model=list[NetworkMetricResponse])
 async def network_metrics(
-    node_id: str,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    return await get_network_metrics(db, nid, start, end)
+    return await get_network_metrics(db, node_uuid, start, end)
 
 
 @router.get("/processes", response_model=list[ProcessMetricResponse])
 async def top_processes(
-    node_id: str,
+    node_uuid: uuid.UUID,
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    return await get_top_processes(db, nid, limit)
+    return await get_top_processes(db, node_uuid, limit)
 
 
 @router.get("/export")
 async def export_metrics_endpoint(
-    node_id: str,
+    node_uuid: uuid.UUID,
     start: datetime,
     end: datetime,
     fmt: str = Query("json", alias="format"),
     db: AsyncSession = Depends(get_db),
 ):
-    nid = uuid.UUID(node_id)
-    result = await export_metrics(db, nid, start, end, fmt)
+    result = await export_metrics(db, node_uuid, start, end, fmt)
     if fmt == "csv":
         return PlainTextResponse(
             result, media_type="text/csv",
