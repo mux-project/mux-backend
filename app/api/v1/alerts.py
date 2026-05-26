@@ -81,15 +81,19 @@ async def delete_rule(
 async def get_history(
     status: str | None = Query(None),
     node_uuid: uuid.UUID | None = Query(None),
+    rule_id: uuid.UUID | None = Query(None),
     start: datetime | None = Query(None),
     end: datetime | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    return await list_alert_history(
-        db, status, node_uuid, start, end, page, page_size
-    )
+    try:
+        return await list_alert_history(
+            db, status, node_uuid, start, end, page, page_size, rule_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.patch("/history/{history_id}/ack", response_model=AlertAckResponse)

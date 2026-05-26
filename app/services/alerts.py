@@ -9,10 +9,14 @@ from app.models.alert_rule import AlertRule
 from app.models.alert_history import AlertHistory
 from app.models.node import Node
 from app.schemas.alert_history import AlertHistoryResponse
-from app.schemas.alert_rule import AlertRuleCreate, AlertRuleResponse, AlertRuleUpdate
+from app.schemas.alert_rule import (
+    ALERT_STATUSES,
+    VALID_OPERATORS,
+    AlertRuleCreate,
+    AlertRuleResponse,
+    AlertRuleUpdate,
+)
 from app.services.nodes import resolve_node_uuid
-
-VALID_OPERATORS = {"gt", "lt", "gte", "lte", "eq"}
 
 
 async def list_alert_rules(
@@ -110,7 +114,13 @@ async def list_alert_history(
     end: datetime | None = None,
     page: int = 1,
     page_size: int = 20,
+    rule_id: uuid.UUID | None = None,
 ) -> dict:
+    if status is not None and status not in ALERT_STATUSES:
+        raise ValueError(
+            f"Invalid status '{status}'. Must be one of: {', '.join(sorted(ALERT_STATUSES))}"
+        )
+
     filters = []
     if status:
         filters.append(AlertHistory.status == status)
@@ -121,6 +131,8 @@ async def list_alert_history(
         filters.append(AlertHistory.triggered_at >= start)
     if end:
         filters.append(AlertHistory.triggered_at <= end)
+    if rule_id:
+        filters.append(AlertHistory.rule_id == rule_id)
 
     count_query = select(sa_func.count()).select_from(AlertHistory)
     if filters:
