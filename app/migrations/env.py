@@ -8,6 +8,7 @@ from sqlalchemy import pool
 from app.config import settings
 from app.database.base import Base
 from app.models import (  # noqa: F401 — registers models on Base.metadata
+    AlertBreach,
     AlertHistory,
     AlertRule,
     NetworkMetric,

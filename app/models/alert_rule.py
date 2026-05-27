@@ -24,3 +24,10 @@ class AlertRule(Base, TimestampMixin):
         ARRAY(UUID(as_uuid=True))
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    renotify_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=900
+    )
+    cooldown_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )

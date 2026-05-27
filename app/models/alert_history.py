@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,7 +16,9 @@ class AlertHistory(Base):
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
     )
     rule_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("alert_rules.id"), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("alert_rules.id", ondelete="SET NULL"),
+        nullable=True,
     )
     node_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("nodes.id"), nullable=False
@@ -33,3 +35,8 @@ class AlertHistory(Base):
         UUID(as_uuid=True), ForeignKey("users.id")
     )
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    rule_version: Mapped[int | None] = mapped_column(Integer)
+    notified_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

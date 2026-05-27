@@ -1,11 +1,15 @@
 import csv
 import io
+import json
 import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func as sa_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.core.logging import logger
+from app.core.redis import get_redis
 from app.models.network_metric import NetworkMetric
 from app.models.process_metric import ProcessMetric
 from app.models.system_metric import SystemMetric
@@ -241,4 +245,70 @@ async def create_metrics(
             counts["process_metrics"] += 1
 
     await db.commit()
+
+    # Publish to Redis Stream for alert engine consumption
+    try:
+        redis = await get_redis()
+        base_ts = collected_at.isoformat()
+
+        # System metric entry
+        if payload.system:
+            msg_id = f"{payload.node_id}:system:{base_ts}"
+            await redis.xadd(
+                settings.ALERT_ENGINE_STREAM_NAME,
+                {
+                    "msg_id": msg_id,
+                    "tenant_id": "",
+                    "node_id": str(node_id),
+                    "metric_type": "system",
+                    "data": json.dumps(payload.system.model_dump()),
+                    "collected_at": base_ts,
+                },
+                maxlen=settings.ALERT_ENGINE_MAXLEN,
+                approximate=True,
+            )
+
+        # Network metric entries (one per interface)
+        if payload.network:
+            for idx, iface in enumerate(payload.network):
+                msg_id = f"{payload.node_id}:network:{idx}:{base_ts}"
+                await redis.xadd(
+                    settings.ALERT_ENGINE_STREAM_NAME,
+                    {
+                        "msg_id": msg_id,
+                        "tenant_id": "",
+                        "node_id": str(node_id),
+                        "metric_type": "network",
+                        "data": json.dumps(iface.model_dump()),
+                        "collected_at": base_ts,
+                    },
+                    maxlen=settings.ALERT_ENGINE_MAXLEN,
+                    approximate=True,
+                )
+
+        # Process metric entries (one per process)
+        if payload.processes:
+            for idx, proc in enumerate(payload.processes):
+                msg_id = f"{payload.node_id}:process:{idx}:{base_ts}"
+                await redis.xadd(
+                    settings.ALERT_ENGINE_STREAM_NAME,
+                    {
+                        "msg_id": msg_id,
+                        "tenant_id": "",
+                        "node_id": str(node_id),
+                        "metric_type": "process",
+                        "data": json.dumps(proc.model_dump()),
+                        "collected_at": base_ts,
+                    },
+                    maxlen=settings.ALERT_ENGINE_MAXLEN,
+                    approximate=True,
+                )
+
+    except Exception:
+        logger.exception(
+            "metric_stream_publish_failed",
+            node_id=str(node_id),
+            stream=settings.ALERT_ENGINE_STREAM_NAME,
+        )
+
     return IngestResponse(**counts)
