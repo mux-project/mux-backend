@@ -6,6 +6,7 @@ Handles all alert_history INSERT/UPDATE operations with:
   - Optimistic locking on resolve to prevent stale-wins-latest races
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
+from app.alerts import metrics
 from app.alerts.cache import CachedRule
 from app.alerts.notifier import dispatch_notifications
 from app.alerts.state import StateManager
@@ -79,6 +81,7 @@ async def fire_alert(
             )
         except IntegrityError:
             await session.rollback()
+            metrics.alert_db_errors.labels(operation="integrity").inc()
             logger.warning(
                 "fire_integrity_error_recovering",
                 rule_id=str(rule.id),
@@ -97,10 +100,15 @@ async def fire_alert(
             fired_at=redis_now,
         )
 
-        # 5. Dispatch notification (inside idempotency guard — exactly once per active alert)
-        await dispatch_notifications(
-            rule=rule, node_id=node_id, value=value, alert_history_id=alert.id,
+        # 5. Dispatch notification in background task (H4 — avoid blocking the hot path)
+        asyncio.ensure_future(
+            dispatch_notifications(
+                rule=rule, node_id=node_id, value=value, alert_history_id=alert.id,
+            )
         )
+
+        # 6. Metrics
+        metrics.alert_fired.labels(rule_name=rule.name, tenant=tenant_id).inc()
 
         return alert.id
 
@@ -160,16 +168,21 @@ async def resolve_alert(
         await state.delete_active_alert(rule.id, node_id)
         await state.delete_breach_window(rule.id, node_id)
 
-        # 3. Dispatch resolve notification
-        await dispatch_notifications(
-            rule=rule,
-            node_id=node_id,
-            value=active_alert.get("value", 0.0),
-            alert_history_id=alert_history_id,
-            is_resolve=True,
+        # 3. Metrics
+        metrics.alert_resolved.labels(rule_name=rule.name, tenant="").inc()
+
+        # 4. Dispatch resolve notification in background task (H4)
+        asyncio.ensure_future(
+            dispatch_notifications(
+                rule=rule,
+                node_id=node_id,
+                value=active_alert.get("value", 0.0),
+                alert_history_id=alert_history_id,
+                is_resolve=True,
+            )
         )
 
-        # 4. Set cooldown
+        # 5. Set cooldown
         await state.set_cooldown(rule.id, node_id, rule.cooldown_seconds)
 
         logger.info(

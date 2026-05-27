@@ -14,10 +14,14 @@ Lifecycle:
 
 import asyncio
 import signal
+import threading
 import uuid
 from datetime import datetime, timezone
 from functools import partial
 
+from prometheus_client import start_http_server
+
+from app.alerts import metrics
 from app.alerts.cache import rule_cache
 from app.alerts.consumer import StreamConsumer
 from app.alerts.db_writer import delete_breach_window_db, fire_alert, persist_breach_window, resolve_alert
@@ -89,15 +93,17 @@ async def process_metric(
 
         for rule in rules:
             try:
-                decision = await evaluate_metric(
-                    state=state,
-                    rule=rule,
-                    node_id=parsed_node_id,
-                    value=value,
-                    collected_at=collected_ts,
-                )
+                with metrics.alert_evaluation_duration.time():
+                    decision = await evaluate_metric(
+                        state=state,
+                        rule=rule,
+                        node_id=parsed_node_id,
+                        value=value,
+                        collected_at=collected_ts,
+                    )
 
                 action = decision.get("action")
+                metrics.alert_evaluations.labels(result=action).inc()
 
                 if action == "fire":
                     # Clean up persisted breach window, then fire (includes notification dispatch)
@@ -164,6 +170,14 @@ async def run_worker(stop_event: asyncio.Event) -> None:
         stream=settings.ALERT_ENGINE_STREAM_NAME,
         group=settings.ALERT_ENGINE_CONSUMER_GROUP,
     )
+
+    # 0. Start Prometheus metrics HTTP server (port 8001 by default)
+    metrics_port = getattr(settings, "ALERT_ENGINE_METRICS_PORT", 8001)
+    try:
+        start_http_server(metrics_port)
+        logger.info("prometheus_metrics_server_started", port=metrics_port)
+    except Exception as exc:
+        logger.warning("prometheus_metrics_server_failed", error=str(exc), port=metrics_port)
 
     # 1. Connect to Redis
     redis = await get_redis()

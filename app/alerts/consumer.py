@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+from app.alerts import metrics
 from app.config import settings
 from app.core.logging import logger
 from app.core.redis import get_redis
@@ -94,6 +95,7 @@ class StreamConsumer:
             "failed_at": str(asyncio.get_event_loop().time()),
         }
         await r.xadd(self.dlq, dlq_entry, maxlen=10000, approximate=True)
+        metrics.alert_dlq_entries.inc()
         logger.warning(
             "message_sent_to_dlq",
             msg_id=msg_id_str,
@@ -106,13 +108,22 @@ class StreamConsumer:
         """Check if this message was already processed successfully.
 
         Returns True if already processed (skip+ACK).
+        Does NOT set the key — caller must call _mark_processed after
+        successful processing to avoid breaking retries (C1).
         Key includes tenant_id to prevent cross-tenant collisions.
         """
         key = f"processed:{tenant_id}:{msg_id_str}" if tenant_id else f"processed:{msg_id_str}"
-        if await r.exists(key):
-            return True
+        return await r.exists(key)
+
+    async def _mark_processed(self, r, msg_id_str, tenant_id: str = ""):
+        """Mark a message as successfully processed (called AFTER callback success).
+
+        Sets a TTL-scoped key so future duplicates are skipped.
+        This must only be called AFTER the processing callback succeeds,
+        otherwise retries are permanently blocked (C1 fix).
+        """
+        key = f"processed:{tenant_id}:{msg_id_str}" if tenant_id else f"processed:{msg_id_str}"
         await r.setex(key, self.idempotency_ttl, "1")
-        return False
 
     async def _check_retries(self, r, msg_id_str, tenant_id: str = ""):
         """Check and increment retry count.
@@ -124,6 +135,8 @@ class StreamConsumer:
         retries = await r.incr(key)
         if retries == 1:
             await r.expire(key, self.idempotency_ttl)
+        if retries > 1:
+            metrics.alert_retries.inc()
         return retries, retries >= self.max_retries
 
     async def _process_single(self, r, msg_id_str, msg_data):
@@ -139,6 +152,7 @@ class StreamConsumer:
         # 2. Idempotency check (24h window)
         if await self._check_idempotency(r, msg_data.get("msg_id", msg_id_str), tenant_id):
             logger.debug("message_already_processed", msg_id=msg_id_str)
+            metrics.alert_messages_consumed.labels(status="skip").inc()
             return True  # ACK and skip
 
         # 3. Retry check
@@ -158,13 +172,24 @@ class StreamConsumer:
                 except json.JSONDecodeError:
                     data = {}
 
-            await self._process_callback(
-                node_id=msg_data.get("node_id"),
-                metric_type=msg_data.get("metric_type", "system"),
-                data=data,
-                collected_at=msg_data.get("collected_at"),
-                tenant_id=msg_data.get("tenant_id", ""),
-            )
+            try:
+                await self._process_callback(
+                    node_id=msg_data.get("node_id"),
+                    metric_type=msg_data.get("metric_type", "system"),
+                    data=data,
+                    collected_at=msg_data.get("collected_at"),
+                    tenant_id=msg_data.get("tenant_id", ""),
+                )
+            except Exception:
+                # Do NOT mark as processed — retry will re-invoke callback (C1)
+                raise
+
+        # 5. Mark as processed (only after callback succeeds)
+        # Must not prevent XACK on Redis failure — message is idempotent at app layer
+        try:
+            await self._mark_processed(r, msg_data.get("msg_id", msg_id_str), tenant_id)
+        except Exception:
+            logger.exception("mark_processed_failed", msg_id=msg_id_str)
 
         return True  # ACK
 
@@ -189,12 +214,14 @@ class StreamConsumer:
                     if ok:
                         await r.xack(self.stream, self.group, msg_id)
                         processed += 1
+                        metrics.alert_messages_consumed.labels(status="ack").inc()
                 except Exception as exc:
                     logger.exception(
                         "message_processing_failed",
                         msg_id=msg_id,
                         error=str(exc),
                     )
+                    metrics.alert_messages_consumed.labels(status="error").inc()
                     # Do NOT XACK — message stays pending for re-delivery
 
         return processed
@@ -229,6 +256,7 @@ class StreamConsumer:
                     await r.ping()
                 except Exception:
                     logger.critical("redis_connection_lost", stream=self.stream)
+                    metrics.alert_redis_errors.labels(operation="connection").inc()
                     await asyncio.sleep(5)
                     r = await get_redis()
                     continue

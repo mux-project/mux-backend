@@ -35,7 +35,13 @@ async def rebuild_state_from_db(state: StateManager) -> int:
     if not rule_cache.is_loaded:
         await rule_cache.refresh()
 
-    # 3. Load all firing alerts from DB
+    # 3. Clear any stale active_set members from previous lifecycle (H2)
+    await state._r.delete(state._active_set_key())
+
+    # 4. Clean up old-format UUID keys (with hyphens) from before F9 fix (H3)
+    await _cleanup_legacy_uuids(state)
+
+    # 5. Load all firing alerts from DB
     restored = 0
     async with async_session_factory() as session:
         result = await session.execute(
@@ -80,7 +86,7 @@ async def rebuild_state_from_db(state: StateManager) -> int:
 
             restored += 1
 
-    # 4. Rebuild breach windows (duration tracking) from DB
+    # 5. Rebuild breach windows (duration tracking) from DB
     breach_count = await _rebuild_breach_windows(state)
 
     logger.info(
@@ -140,3 +146,29 @@ async def _rebuild_breach_windows(state: StateManager) -> int:
         logger.info("breach_windows_restored", count=restored)
 
     return restored
+
+
+UUID_KEY_PATTERN_LEN = 36  # "550e8400-e29b-41d4-a716-446655440000"
+
+
+async def _cleanup_legacy_uuids(state: StateManager) -> None:
+    """Delete Redis keys using the old hyphenated UUID format (before F9 fix).
+
+    After F9, all UUIDs use 32-char hex (no hyphens). Old keys with hyphens
+    are orphaned. This deletes them on recovery to free memory.
+    """
+    r = state._r
+    removed = 0
+    for prefix in ("active", "breach", "lock:eval", "cooldown"):
+        # Match keys with hyphenated UUID segments: XXXX-XXXX-...
+        pattern = f"{prefix}:{':*' if state._tenant else ''}*????-*"
+        async for key in r.scan_iter(match=pattern):
+            # Double-check: is the UUID segment 36 chars with hyphens?
+            parts = key.split(":")
+            uuid_candidate = parts[-1] if len(parts) >= 2 else ""
+            if len(uuid_candidate) == UUID_KEY_PATTERN_LEN and "-" in uuid_candidate:
+                await r.delete(key)
+                removed += 1
+
+    if removed > 0:
+        logger.info("legacy_uuid_keys_cleaned_up", count=removed)

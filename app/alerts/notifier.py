@@ -11,6 +11,7 @@ break the metric processing pipeline.
 import uuid
 from datetime import datetime, timezone
 
+from app.alerts import metrics
 from app.alerts.cache import CachedRule
 from app.alerts.notifiers.email import send_email_alert
 from app.alerts.notifiers.slack import send_slack_alert
@@ -73,13 +74,16 @@ async def dispatch_notifications(
             if channel_type == "email":
                 recipient = channel.get("recipient", "")
                 if recipient:
-                    ok = await send_email_alert(recipient, subject, body)
+                    with metrics.alert_notification_duration.labels(channel="email").time():
+                        ok = await send_email_alert(recipient, subject, body)
                     if ok:
                         notified.append(f"email:{recipient}")
+                    metrics.alert_notifications.labels(channel="email", result="ok" if ok else "fail").inc()
 
             elif channel_type == "slack":
                 webhook = channel.get("webhook_url", "")
-                ok = await send_slack_alert(
+                with metrics.alert_notification_duration.labels(channel="slack").time():
+                    ok = await send_slack_alert(
                     webhook_url=webhook,
                     message=subject,
                     title=title,
@@ -92,6 +96,7 @@ async def dispatch_notifications(
                 )
                 if ok:
                     notified.append("slack")
+                metrics.alert_notifications.labels(channel="slack", result="ok" if ok else "fail").inc()
 
             else:
                 logger.warning("unknown_channel_type", channel_type=channel_type)

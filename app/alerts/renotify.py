@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
+from app.alerts import metrics
 from app.alerts.cache import CachedRule, rule_cache
 from app.alerts.notifier import dispatch_notifications
 from app.alerts.state import StateManager
@@ -80,6 +81,14 @@ async def _run_renotify_cycle(state: StateManager) -> None:
     redis_now = await state.redis_time()
     active_alerts = await state.scan_active_alerts()
 
+    metrics.alert_active_count.set(len(active_alerts))
+
+    if not active_alerts:
+        return
+
+    # Batch-check all alerts' DB status in a single query (H1 — kills N+1)
+    firing_states = await _batch_check_firing([a[2]["alert_history_id"] for _, _, a in active_alerts])
+
     for rule_id, node_id, alert_state in active_alerts:
         alert_history_id = alert_state["alert_history_id"]
         fired_at = alert_state["fired_at"]
@@ -87,8 +96,8 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         current_value = alert_state["value"]
         notified_count = alert_state.get("notified_count", 0)
 
-        # 1. Check DB: is this alert still firing?
-        still_firing = await _is_alert_firing(alert_history_id)
+        # 1. Check DB: is this alert still firing? (batched)
+        still_firing = firing_states.get(alert_history_id, False)
         if not still_firing:
             # Ghost alert — clean up Redis key
             await state.delete_active_alert(rule_id, node_id)
@@ -161,6 +170,11 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         await _update_last_notified_db(alert_history_id, redis_now)
 
         if notified:
+            metrics.alert_renotified.labels(
+                rule_name=rule.name,
+                channel=",".join(notified),
+                escalation_level=str(escalation),
+            ).inc()
             logger.info(
                 "alert_renotified",
                 rule_id=str(rule_id),
@@ -172,14 +186,21 @@ async def _run_renotify_cycle(state: StateManager) -> None:
             )
 
 
-async def _is_alert_firing(alert_history_id: uuid.UUID) -> bool:
-    """Check if an alert_history record still has status='firing'."""
+async def _batch_check_firing(ids: list[uuid.UUID]) -> dict[uuid.UUID, bool]:
+    """Batch-check firing status for multiple alert history IDs (H1).
+
+    Returns {alert_history_id: is_firing} dict with a single DB query.
+    """
+    if not ids:
+        return {}
     async with async_session_factory() as session:
         result = await session.execute(
-            select(AlertHistory.status).where(AlertHistory.id == alert_history_id)
+            select(AlertHistory.id, AlertHistory.status).where(
+                AlertHistory.id.in_(ids)
+            )
         )
-        row = result.scalar_one_or_none()
-        return row == "firing"
+        rows = result.all()
+        return {row.id: row.status == "firing" for row in rows}
 
 
 async def _update_last_notified_db(
