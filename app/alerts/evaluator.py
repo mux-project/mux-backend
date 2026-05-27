@@ -5,6 +5,7 @@ duration-based breach windows, and triggers fire/resolve
 decisions via the DB Writer.
 """
 
+import asyncio
 import operator
 import uuid
 
@@ -20,6 +21,26 @@ OPERATORS = {
     "lte": operator.le,
     "eq": operator.eq,
 }
+
+# --- Redis resilience helper (H10) ---
+
+_RETRYABLE = (TimeoutError, ConnectionError)
+
+
+async def redis_op_with_retry(fn, *args, retries=3, base_delay=0.05, **kwargs):
+    """Execute a Redis operation with exponential backoff retry.
+
+    Retries on TimeoutError and ConnectionError (transient failures).
+    Propagates the last exception if all retries are exhausted.
+    Does NOT retry on logical errors (e.g. WRONGTYPE, key not found).
+    """
+    for attempt in range(retries):
+        try:
+            return await fn(*args, **kwargs)
+        except _RETRYABLE as e:
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(base_delay * (2 ** attempt))
 
 
 def threshold_breached(rule_op: str, value: float, threshold: float) -> bool:
@@ -77,15 +98,15 @@ async def evaluate_metric(
 
     # 3. Acquire distributed lock for this (rule, node) — prevents race
     #    between concurrent workers on breach windows and fire decisions (N2).
-    token = await state.acquire_lock(rule.id, node_id)
+    token = await redis_op_with_retry(state.acquire_lock, rule.id, node_id)
     if token is None:
         return decision
 
     try:
-        # 4. Check current state (under lock)
-        active_alert = await state.get_active_alert(rule.id, node_id)
-        in_cooldown = await state.is_in_cooldown(rule.id, node_id)
-        breach_start = await state.get_breach_window(rule.id, node_id)
+        # 4. Check current state (under lock) — all Redis calls use retry (H10)
+        active_alert = await redis_op_with_retry(state.get_active_alert, rule.id, node_id)
+        in_cooldown = await redis_op_with_retry(state.is_in_cooldown, rule.id, node_id)
+        breach_start = await redis_op_with_retry(state.get_breach_window, rule.id, node_id)
 
         if breached:
             if active_alert:
@@ -95,8 +116,8 @@ async def evaluate_metric(
                 return {"action": "none", "value": value}
 
             if breach_start is None:
-                redis_now = await state.redis_time()
-                await state.create_breach_window(rule.id, node_id, redis_now)
+                redis_now = await redis_op_with_retry(state.redis_time)
+                await redis_op_with_retry(state.create_breach_window, rule.id, node_id, redis_now)
                 return {
                     "action": "breach_start",
                     "started_at": redis_now,
@@ -104,9 +125,9 @@ async def evaluate_metric(
                     "duration_seconds": rule.duration_seconds,
                 }
 
-            elapsed = (await state.redis_time()) - breach_start
+            elapsed = (await redis_op_with_retry(state.redis_time)) - breach_start
             if elapsed >= rule.duration_seconds:
-                await state.delete_breach_window(rule.id, node_id)
+                await redis_op_with_retry(state.delete_breach_window, rule.id, node_id)
                 return {
                     "action": "fire",
                     "value": value,
@@ -123,8 +144,8 @@ async def evaluate_metric(
 
         else:
             if breach_start is not None:
-                await state.delete_breach_window(rule.id, node_id)
-                return {"action": "breach_cleared", "breach_duration": (await state.redis_time()) - breach_start}
+                await redis_op_with_retry(state.delete_breach_window, rule.id, node_id)
+                return {"action": "breach_cleared", "breach_duration": (await redis_op_with_retry(state.redis_time)) - breach_start}
 
             if active_alert:
                 return {"action": "resolve", "value": value}
@@ -132,4 +153,8 @@ async def evaluate_metric(
             return {"action": "none"}
 
     finally:
-        await state.release_lock(rule.id, node_id, token)
+        try:
+            await redis_op_with_retry(state.release_lock, rule.id, node_id, token)
+        except Exception:
+            logger.exception("release_lock_failed",
+                             rule_id=str(rule.id), node_id=str(node_id))

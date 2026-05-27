@@ -102,3 +102,7 @@ alert_dlq_entries = Counter(
     "alert_dlq_entries_total",
     "Total messages moved to dead-letter queue",
 )
+alert_empty_payload = Counter(
+    "alert_empty_payload_total",
+    "Total metric messages with empty or missing data payload",
+)

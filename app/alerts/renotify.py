@@ -76,10 +76,47 @@ async def renotify_loop(
     logger.info("renotify_loop_stopped")
 
 
+async def _scan_all_active_alerts(redis) -> list[tuple[uuid.UUID, uuid.UUID, dict, str]]:
+    """Scan ALL active_set variants — no-tenant and per-tenant (F2).
+
+    Returns (rule_id, node_id, alert_state, tenant_id) tuples for
+    every active alert across all tenants.
+    """
+    results = []
+    seen = set()
+
+    async for set_key in redis.scan_iter(match="active_set*"):
+        member_keys = await redis.smembers(set_key)
+        tenant = set_key[len("active_set:"):] if ":" in set_key else ""
+
+        for key in member_keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            raw = await redis.hgetall(key)
+            if not raw:
+                continue
+            parts = key.split(":")
+            results.append((
+                uuid.UUID(hex=parts[-2]),
+                uuid.UUID(hex=parts[-1]),
+                {
+                    "alert_history_id": uuid.UUID(raw["alert_history_id"]),
+                    "rule_version": int(raw["rule_version"]),
+                    "value": float(raw["value"]),
+                    "fired_at": float(raw["fired_at"]),
+                    "last_notified_at": float(raw["last_notified_at"]),
+                    "notified_count": int(raw.get("notified_count", 0)),
+                },
+                tenant,
+            ))
+    return results
+
+
 async def _run_renotify_cycle(state: StateManager) -> None:
-    """Single re-notify cycle — scan, verify, dispatch, clean up."""
+    """Single re-notify cycle — scan all tenants, verify, dispatch, clean up (F2)."""
     redis_now = await state.redis_time()
-    active_alerts = await state.scan_active_alerts()
+    active_alerts = await _scan_all_active_alerts(state._r)
 
     metrics.alert_active_count.set(len(active_alerts))
 
@@ -87,9 +124,11 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         return
 
     # Batch-check all alerts' DB status in a single query (H1 — kills N+1)
-    firing_states = await _batch_check_firing([a[2]["alert_history_id"] for _, _, a in active_alerts])
+    firing_states = await _batch_check_firing([a[2]["alert_history_id"] for _, _, a, _ in active_alerts])
 
-    for rule_id, node_id, alert_state in active_alerts:
+    for rule_id, node_id, alert_state, tenant_id in active_alerts:
+        # Use tenant-scoped state for Redis operations (F2)
+        ts = StateManager(state._r, tenant=tenant_id)
         alert_history_id = alert_state["alert_history_id"]
         fired_at = alert_state["fired_at"]
         last_notified_at = alert_state["last_notified_at"]
@@ -100,8 +139,8 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         still_firing = firing_states.get(alert_history_id, False)
         if not still_firing:
             # Ghost alert — clean up Redis key
-            await state.delete_active_alert(rule_id, node_id)
-            await state.delete_breach_window(rule_id, node_id)
+            await ts.delete_active_alert(rule_id, node_id)
+            await ts.delete_breach_window(rule_id, node_id)
             logger.warning(
                 "ghost_alert_cleaned",
                 rule_id=str(rule_id),
@@ -114,7 +153,7 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         rule = rule_cache.get_by_id(rule_id)
         if not rule or not rule.is_active:
             # Rule was deleted or disabled — force resolve
-            await state.delete_active_alert(rule_id, node_id)
+            await ts.delete_active_alert(rule_id, node_id)
             async with async_session_factory() as session:
                 await session.execute(
                     AlertHistory.__table__.update()
@@ -166,7 +205,7 @@ async def _run_renotify_cycle(state: StateManager) -> None:
         )
 
         # 8. Update last_notified_at in Redis AND DB (also increments notified_count)
-        await state.update_last_notified(rule_id, node_id, redis_now)
+        await ts.update_last_notified(rule_id, node_id, redis_now)
         await _update_last_notified_db(alert_history_id, redis_now)
 
         if notified:
@@ -206,14 +245,18 @@ async def _batch_check_firing(ids: list[uuid.UUID]) -> dict[uuid.UUID, bool]:
 async def _update_last_notified_db(
     alert_history_id: uuid.UUID, timestamp: float
 ) -> None:
-    """Update last_notified_at and increment notified_count in the DB."""
+    """Update last_notified_at in DB for recovery correctness (H2).
+
+    notified_count is NOT written to DB — Redis is the source of truth.
+    Only last_notified_at is persisted so that crash recovery can restore
+    a meaningful renotify interval check.
+    """
     async with async_session_factory() as session:
         await session.execute(
             AlertHistory.__table__.update()
             .where(AlertHistory.id == alert_history_id)
             .values(
                 last_notified_at=datetime.fromtimestamp(timestamp, tz=timezone.utc),
-                notified_count=AlertHistory.notified_count + 1,
             )
         )
         await session.commit()

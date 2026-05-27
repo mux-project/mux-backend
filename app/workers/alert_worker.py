@@ -15,6 +15,7 @@ Lifecycle:
 import asyncio
 import signal
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from functools import partial
@@ -24,7 +25,7 @@ from prometheus_client import start_http_server
 from app.alerts import metrics
 from app.alerts.cache import rule_cache
 from app.alerts.consumer import StreamConsumer
-from app.alerts.db_writer import delete_breach_window_db, fire_alert, persist_breach_window, resolve_alert
+from app.alerts.db_writer import delete_breach_window_db, drain_notification_tasks, fire_alert, persist_breach_window, resolve_alert
 from app.alerts.evaluator import evaluate_metric
 from app.alerts.recovery import rebuild_state_from_db
 from app.alerts.renotify import renotify_loop
@@ -81,12 +82,15 @@ async def process_metric(
     instance is the shared singleton from get_redis().
     """
     if not node_id or not data:
+        logger.debug("empty_data_payload", node_id=node_id)
+        metrics.alert_empty_payload.inc()
         return
 
     state = StateManager(redis, tenant=tenant_id)
     parsed_node_id = uuid.UUID(node_id) if isinstance(node_id, str) else node_id
     collected_ts = _parse_collected_at(collected_at)
 
+    _iter = 0
     async with async_session_factory() as db_session:
         for metric_field, value in _parse_metric_fields(data):
             rules = rule_cache.get_rules_for_field(metric_field)
@@ -94,6 +98,9 @@ async def process_metric(
                 continue
 
             for rule in rules:
+                _iter += 1
+                if _iter % 50 == 0:
+                    await asyncio.sleep(0)
                 try:
                     with metrics.alert_evaluation_duration.time():
                         decision = await evaluate_metric(
@@ -108,7 +115,7 @@ async def process_metric(
                     metrics.alert_evaluations.labels(result=action).inc()
 
                     if action == "fire":
-                        await delete_breach_window_db(rule.id, parsed_node_id, db_session=db_session)
+                        await delete_breach_window_db(rule.id, parsed_node_id, tenant_id=tenant_id, db_session=db_session)
                         await fire_alert(
                             state=state,
                             rule=rule,
@@ -125,15 +132,16 @@ async def process_metric(
                                 rule=rule,
                                 node_id=parsed_node_id,
                                 active_alert=active_alert,
+                                tenant_id=tenant_id,
                             )
 
                     elif action == "breach_start":
                         started_at = decision.get("started_at")
                         if started_at:
-                            await persist_breach_window(rule.id, parsed_node_id, started_at, db_session=db_session)
+                            await persist_breach_window(rule.id, parsed_node_id, started_at, tenant_id=tenant_id, db_session=db_session)
 
                     elif action == "breach_cleared":
-                        await delete_breach_window_db(rule.id, parsed_node_id, db_session=db_session)
+                        await delete_breach_window_db(rule.id, parsed_node_id, tenant_id=tenant_id, db_session=db_session)
 
                 except Exception as exc:
                     logger.exception(
@@ -159,6 +167,79 @@ async def _rule_cache_refresher(stop_event: asyncio.Event) -> None:
             break
         except Exception as exc:
             logger.exception("rule_cache_refresher_error", error=str(exc))
+
+
+async def _metrics_collector(redis, stop_event: asyncio.Event) -> None:
+    """Periodically collect and set Prometheus gauges from Redis state."""
+    while True:
+        try:
+            if stop_event.is_set():
+                break
+            await asyncio.sleep(30)
+
+            # Active alert count — aggregate across ALL tenant sets (C2)
+            total_active = 0
+            async for set_key in redis.scan_iter(match="active_set*", count=100):
+                total_active += await redis.scard(set_key)
+            metrics.alert_active_count.set(total_active)
+
+            # Breach window count — SCAN (non-blocking) instead of KEYS (C1)
+            breach_count = 0
+            async for _ in redis.scan_iter(match="breach:*", count=1000):
+                breach_count += 1
+            metrics.alert_breach_window_count.set(breach_count)
+
+            # Cooldown count — SCAN (non-blocking) instead of KEYS (C1)
+            cooldown_count = 0
+            async for _ in redis.scan_iter(match="cooldown:*", count=1000):
+                cooldown_count += 1
+            metrics.alert_cooldown_count.set(cooldown_count)
+
+            # Stream lag — XPENDING-based fallback for Redis < 7.0 (H3)
+            try:
+                info = await redis.xinfo_groups(settings.ALERT_ENGINE_STREAM_NAME)
+                for g in info:
+                    if g[b"name"] == settings.ALERT_ENGINE_CONSUMER_GROUP.encode():
+                        pending = g.get(b"pending", 0)
+                        metrics.alert_pending_messages.set(pending)
+                        if pending > 0:
+                            lag = g.get(b"lag")
+                            if lag is not None:
+                                metrics.alert_stream_lag.set(float(lag))
+                            else:
+                                # Redis < 7.0 fallback: estimate from oldest pending
+                                try:
+                                    pending_summary = await redis.xpending(
+                                        settings.ALERT_ENGINE_STREAM_NAME,
+                                        settings.ALERT_ENGINE_CONSUMER_GROUP,
+                                    )
+                                    if pending_summary and len(pending_summary) >= 2:
+                                        oldest_id = pending_summary[1]
+                                        if oldest_id:
+                                            oldest_ms = int(oldest_id.split(b"-")[0])
+                                            now_ms = int(time.time() * 1000)
+                                            metrics.alert_stream_lag.set(
+                                                max(0.0, (now_ms - oldest_ms) / 1000.0)
+                                            )
+                                except Exception:
+                                    pass
+                        else:
+                            metrics.alert_stream_lag.set(0.0)
+                        break
+            except Exception:
+                pass
+
+            # DLQ size
+            try:
+                dlq_len = await redis.xlen(settings.ALERT_ENGINE_DLQ_NAME)
+                metrics.alert_dlq_size.set(dlq_len)
+            except Exception:
+                pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.exception("metrics_collector_error", error=str(exc))
 
 
 async def run_worker(stop_event: asyncio.Event) -> None:
@@ -189,7 +270,10 @@ async def run_worker(stop_event: asyncio.Event) -> None:
     # 3. Start rule cache refresher
     cache_task = asyncio.create_task(_rule_cache_refresher(stop_event))
 
-    # 4. Start re-notify + watchdog loop
+    # 4. Start periodic metrics collector
+    metrics_task = asyncio.create_task(_metrics_collector(redis, stop_event))
+
+    # 5. Start re-notify + watchdog loop
     renotify_task = asyncio.create_task(
         renotify_loop(
             state=state,
@@ -199,6 +283,13 @@ async def run_worker(stop_event: asyncio.Event) -> None:
     )
 
     # 5. Start stream consumer
+    # H1: All replicas MUST use the same consumer name for ordering.
+    logger.info(
+        "consumer_config",
+        consumer_name=settings.ALERT_ENGINE_CONSUMER_NAME,
+        consumer_group=settings.ALERT_ENGINE_CONSUMER_GROUP,
+        ordering="enforced" if True else "best_effort",
+    )
     consumer = StreamConsumer(
         stream=settings.ALERT_ENGINE_STREAM_NAME,
         dlq=settings.ALERT_ENGINE_DLQ_NAME,
@@ -217,11 +308,17 @@ async def run_worker(stop_event: asyncio.Event) -> None:
     finally:
         logger.info("worker_shutting_down")
         cache_task.cancel()
+        metrics_task.cancel()
         renotify_task.cancel()
         try:
-            await asyncio.gather(cache_task, renotify_task, return_exceptions=True)
+            await asyncio.wait(
+                [cache_task, metrics_task, renotify_task],
+                timeout=10,
+                return_when=asyncio.ALL_COMPLETED,
+            )
         except Exception:
             pass
+        await drain_notification_tasks(timeout=10)
         await close_redis()
         logger.info("worker_shutdown_complete")
 
@@ -243,10 +340,9 @@ def main():
         try:
             loop.add_signal_handler(getattr(signal, sig_name), _handle_signal)
         except (NotImplementedError, AttributeError):
-            # Windows: add_signal_handler not available; use signal.signal as fallback
             try:
                 signal.signal(getattr(signal, sig_name), lambda *_: _handle_signal())
-            except (AttributeError, ValueError, OSError):
+            except Exception:
                 pass
 
     try:
@@ -254,10 +350,13 @@ def main():
     except KeyboardInterrupt:
         logger.info("worker_interrupted")
     finally:
-        pending = asyncio.all_tasks(loop)
+        pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task(loop)]
         for task in pending:
             task.cancel()
-        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        if pending:
+            loop.run_until_complete(
+                asyncio.wait(pending, timeout=10, return_when=asyncio.ALL_COMPLETED)
+            )
         loop.close()
 
 

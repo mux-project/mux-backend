@@ -31,6 +31,7 @@ async def dispatch_notifications(
     is_renotify: bool = False,
     is_resolve: bool = False,
     escalation_level: int = 0,
+    tenant_id: str = "",
 ) -> list[str]:
     """Send alert notifications to all configured channels.
 
@@ -46,6 +47,7 @@ async def dispatch_notifications(
         is_renotify: True if this is a re-notification
         is_resolve: True if this is a resolve notification
         escalation_level: 0=default, 1=escalated, 2=critical
+        tenant_id: The tenant that owns this alert (F3)
     """
     notified = []
     channels = rule.channels or []
@@ -113,10 +115,11 @@ async def dispatch_notifications(
                 "notification_failed",
                 channel=channel_type,
                 rule_id=str(rule.id),
+                tenant_id=tenant_id,
                 error=str(exc),
             )
 
     if not notified:
-        logger.debug("no_notifications_sent", rule_id=str(rule.id))
+        logger.debug("no_notifications_sent", rule_id=str(rule.id), tenant_id=tenant_id)
 
     return notified

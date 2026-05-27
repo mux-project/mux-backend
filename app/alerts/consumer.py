@@ -15,6 +15,17 @@ class StreamConsumer:
 
     Never XACKs on failure — pending messages are re-delivered
     to another consumer in the group via XAUTOCLAIM.
+
+    Ordering guarantee (H1):
+    All workers in a consumer group must use the SAME consumer name
+    to preserve message ordering. Redis Streams consumer groups
+    deliver each message to exactly one consumer — with different
+    consumer names, messages for the same (rule, node) may be
+    delivered to different workers and processed out of order,
+    causing fire/resolve reversals.
+
+    Set ALERT_ENGINE_CONSUMER_NAME to the same value across all
+    worker replicas for ordered delivery.
     """
 
     def __init__(
@@ -75,7 +86,7 @@ class StreamConsumer:
                 self.stream,
                 self.group,
                 self.consumer,
-                min_idle_time=60000,  # 60s idle → reclaim
+                min_idle_time=300000,  # 5 min idle → reclaim (M16)
                 count=self.claim_count,
             )
             if claimed:
@@ -85,6 +96,12 @@ class StreamConsumer:
 
     async def _move_to_dlq(self, r, msg_id_str, msg_data, error_info):
         """Move a permanently-failed message to the dead-letter queue."""
+        # H8: clear retry key so DLQ replay doesn't loop back immediately
+        tenant_id = msg_data.get("tenant_id", "")
+        retry_key = f"retry:{tenant_id}:{msg_id_str}" if tenant_id else f"retry:{msg_id_str}"
+        await r.delete(retry_key)
+        logger.debug("dlq_retry_key_cleared", msg_id=msg_id_str, retry_key=retry_key)
+
         dlq_entry = {
             "original_msg_id": msg_id_str,
             "tenant_id": msg_data.get("tenant_id", ""),
@@ -246,6 +263,7 @@ class StreamConsumer:
 
         # Main loop
         self._running = True
+        claim_counter = 0
         while self._running:
             try:
                 if stop_event and stop_event.is_set():
@@ -260,6 +278,11 @@ class StreamConsumer:
                     await asyncio.sleep(5)
                     r = await get_redis()
                     continue
+
+                # H4: periodic XAUTOCLAIM to prevent PEL growth from dead consumers
+                claim_counter += 1
+                if claim_counter % 60 == 0:
+                    await self._recover_pending(r)
 
                 processed = await self.run_once(r)
 

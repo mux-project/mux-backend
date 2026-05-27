@@ -120,6 +120,7 @@ class StateManager:
         value: float,
         fired_at: float,
         last_notified_at: float | None = None,
+        notified_count: int = 0,
     ) -> None:
         """Record an alert as currently firing in Redis.
 
@@ -133,7 +134,7 @@ class StateManager:
             "value": str(value),
             "fired_at": str(fired_at),
             "last_notified_at": str(last_notified_at or fired_at),
-            "notified_count": "0",
+            "notified_count": str(notified_count),
         })
         await self._r.sadd(self._active_set_key(), key)
 
@@ -172,13 +173,19 @@ class StateManager:
     async def update_last_notified(
         self, rule_id: uuid.UUID, node_id: uuid.UUID, notified_at: float
     ) -> int:
-        """Update last_notified_at and increment notified_count atomically.
+        """Update last_notified_at and increment notified_count atomically (H7).
+
+        Uses a LUA script to prevent partial updates if a crash occurs
+        between the HSET and HINCRBY commands.
 
         Returns the new notified_count after increment.
         """
         key = self._key("active", self._uuid_key(rule_id), self._uuid_key(node_id))
-        await self._r.hset(key, "last_notified_at", str(notified_at))
-        new_count = await self._r.hincrby(key, "notified_count", 1)
+        lua = """
+        redis.call("HSET", KEYS[1], "last_notified_at", ARGV[1])
+        return redis.call("HINCRBY", KEYS[1], "notified_count", 1)
+        """
+        new_count = await self._r.eval(lua, 1, key, str(notified_at))
         return new_count
 
     async def scan_active_alerts(self) -> list[tuple[uuid.UUID, uuid.UUID, dict]]:

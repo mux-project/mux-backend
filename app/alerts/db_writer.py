@@ -24,6 +24,29 @@ from app.database.session import async_session_factory
 from app.models.alert_breach import AlertBreach
 from app.models.alert_history import AlertHistory
 
+# --- Notification task tracking (N21 — graceful drain on shutdown) ---
+
+_notification_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_notification(coro) -> asyncio.Task:
+    """Fire-and-forget a notification coroutine, tracking it for drain."""
+    task = asyncio.ensure_future(coro)
+    _notification_tasks.add(task)
+    task.add_done_callback(_notification_tasks.discard)
+    return task
+
+
+async def drain_notification_tasks(timeout: float = 10) -> None:
+    """Await all in-flight notification tasks during shutdown."""
+    if not _notification_tasks:
+        return
+    tasks = list(_notification_tasks)
+    _notification_tasks.clear()
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for t in pending:
+        t.cancel()
+
 
 @asynccontextmanager
 async def _session_scope(db_session: AsyncSession | None):
@@ -62,17 +85,20 @@ async def fire_alert(
         logger.debug("fire_skipped_cooldown", rule_id=str(rule.id), node_id=str(node_id))
         return None
 
-    # 2. Build the alert history record
-    now = datetime.now(timezone.utc)
+    # 2. Use Redis clock for both DB and Redis state (N19 — prevent
+    #    silent resolve failures under clock drift between app and Redis).
+    redis_now = await state.redis_time()
+    triggered_at = datetime.fromtimestamp(redis_now, tz=timezone.utc)
     alert = AlertHistory(
         rule_id=rule.id,
         node_id=node_id,
+        tenant_id=tenant_id,
         status="firing",
         metric_value=value,
         message=f"Alert: {rule.name} — {rule.metric_field} {rule.operator} {rule.threshold} (value: {value})",
-        triggered_at=now,
+        triggered_at=triggered_at,
         rule_version=rule.version,
-        last_notified_at=now,
+        last_notified_at=triggered_at,
     )
 
     # 3. Insert into DB (with IntegrityError recovery)
@@ -97,11 +123,20 @@ async def fire_alert(
                 "fire_integrity_error_recovering",
                 rule_id=str(rule.id),
                 node_id=str(node_id),
+                tenant_id=tenant_id,
             )
-            return await _rebuild_active_from_db(state, rule, node_id)
+            alert_history_id = await _rebuild_active_from_db(state, rule, node_id, db_session=session)
+            if alert_history_id:
+                logger.info(
+                    "fire_conflict_resolved_reusing_existing",
+                    rule_id=str(rule.id),
+                    node_id=str(node_id),
+                    tenant_id=tenant_id,
+                    alert_history_id=str(alert_history_id),
+                )
+            return alert_history_id
 
-        # 4. Set Redis active alert state
-        redis_now = await state.redis_time()
+        # 4. Set Redis active alert state (using same redis_now as DB)
         await state.set_active_alert(
             rule_id=rule.id,
             node_id=node_id,
@@ -111,14 +146,29 @@ async def fire_alert(
             fired_at=redis_now,
         )
 
-        # 5. Dispatch notification in background task (H4 — avoid blocking the hot path)
-        asyncio.ensure_future(
+        # 5. Clean up any legacy no-tenant key that may exist from a
+        #    pre-F1 crash recovery (F1 — prevents ghost renotify spam
+        #    when a recovered no-tenant active key survives alongside
+        #    this new tenant-scoped key).
+        legacy_key = f"active:{state._uuid_key(rule.id)}:{state._uuid_key(node_id)}"
+        if await state._r.exists(legacy_key):
+            await state._r.srem("active_set", legacy_key)
+            await state._r.delete(legacy_key)
+            logger.info(
+                "legacy_no_tenant_active_cleaned",
+                rule_id=str(rule.id),
+                node_id=str(node_id),
+            )
+
+        # 7. Dispatch notification in background task (H4 — avoid blocking the hot path)
+        _spawn_notification(
             dispatch_notifications(
                 rule=rule, node_id=node_id, value=value, alert_history_id=alert.id,
+                tenant_id=tenant_id,
             )
         )
 
-        # 6. Metrics
+        # 8. Metrics
         metrics.alert_fired.labels(rule_name=rule.name, tenant=tenant_id).inc()
 
         return alert.id
@@ -131,6 +181,7 @@ async def resolve_alert(
     rule: CachedRule,
     node_id: uuid.UUID,
     active_alert: dict,
+    tenant_id: str = "",
 ) -> bool:
     """Resolve an actively firing alert.
 
@@ -146,6 +197,8 @@ async def resolve_alert(
 
     async with async_session_factory() as session:
         # 1. Optimistic-locked update
+        redis_now = await state.redis_time()
+        resolved_at = datetime.fromtimestamp(redis_now, tz=timezone.utc)
         result = await session.execute(
             update(AlertHistory)
             .where(
@@ -155,7 +208,7 @@ async def resolve_alert(
             )
             .values(
                 status="resolved",
-                resolved_at=datetime.now(timezone.utc),
+                resolved_at=resolved_at,
             )
         )
 
@@ -180,29 +233,31 @@ async def resolve_alert(
         await state.delete_breach_window(rule.id, node_id)
 
         # 3. Metrics
-        metrics.alert_resolved.labels(rule_name=rule.name, tenant="").inc()
+        metrics.alert_resolved.labels(rule_name=rule.name, tenant=tenant_id).inc()
 
         # 4. Dispatch resolve notification in background task (H4)
-        asyncio.ensure_future(
+        _spawn_notification(
             dispatch_notifications(
                 rule=rule,
                 node_id=node_id,
                 value=active_alert.get("value", 0.0),
                 alert_history_id=alert_history_id,
                 is_resolve=True,
+                tenant_id=tenant_id,
             )
         )
 
         # 5. Set cooldown
         await state.set_cooldown(rule.id, node_id, rule.cooldown_seconds)
 
+        duration_seconds = redis_now - active_alert["fired_at"]
         logger.info(
             "alert_resolved",
             rule_id=str(rule.id),
             rule_name=rule.name,
             node_id=str(node_id),
             alert_history_id=str(alert_history_id),
-            duration_seconds=active_alert.get("fired_at", 0),
+            duration_seconds=duration_seconds,
         )
         return True
 
@@ -211,21 +266,24 @@ async def _rebuild_active_from_db(
     state: StateManager,
     rule: CachedRule,
     node_id: uuid.UUID,
+    db_session: AsyncSession | None = None,
 ) -> uuid.UUID | None:
     """Rebuild Redis active alert state from the database.
 
     Called when an IntegrityError indicates that a firing alert
-    already exists for this (rule, node) — some other worker
+    already exists for this (rule, node, tenant) — some other worker
     beat us to it. We restore Redis state from the DB row.
+    Must scope by tenant_id to avoid cross-tenant recovery (F1).
 
     Returns the alert_history_id of the existing firing alert.
     """
-    async with async_session_factory() as session:
+    async with _session_scope(db_session) as session:
         result = await session.execute(
             select(AlertHistory)
             .where(
                 AlertHistory.rule_id == rule.id,
                 AlertHistory.node_id == node_id,
+                AlertHistory.tenant_id == state._tenant,
                 AlertHistory.status == "firing",
             )
             .order_by(AlertHistory.triggered_at.desc())
@@ -254,6 +312,7 @@ async def _rebuild_active_from_db(
             value=existing.metric_value,
             fired_at=existing.triggered_at.timestamp(),
             last_notified_at=notified_ts,
+            notified_count=existing.notified_count or 0,
         )
 
         logger.info(
@@ -269,12 +328,13 @@ async def persist_breach_window(
     rule_id: uuid.UUID,
     node_id: uuid.UUID,
     started_at: float,
+    tenant_id: str = "",
     db_session: AsyncSession | None = None,
 ) -> None:
     """Persist a breach window to the database for crash recovery.
 
-    Uses PostgreSQL ON CONFLICT (rule_id, node_id) DO NOTHING
-    to handle concurrent upserts safely.
+    Uses PostgreSQL ON CONFLICT (rule_id, node_id, tenant_id) DO NOTHING
+    to handle concurrent upserts safely (H2).
     Accepts an optional pre-existing session for batch reuse (N4).
     """
     async with _session_scope(db_session) as session:
@@ -284,22 +344,25 @@ async def persist_breach_window(
                 ).values(
                     rule_id=rule_id,
                     node_id=node_id,
+                    tenant_id=tenant_id,
                     started_at=datetime.fromtimestamp(started_at, tz=timezone.utc),
                 )
             )
             await session.commit()
         except Exception:
             await session.rollback()
-            logger.exception("persist_breach_window_failed", rule_id=str(rule_id), node_id=str(node_id))
+            logger.exception("persist_breach_window_failed", rule_id=str(rule_id), node_id=str(node_id), tenant_id=tenant_id)
 
 
 async def delete_breach_window_db(
     rule_id: uuid.UUID,
     node_id: uuid.UUID,
+    tenant_id: str = "",
     db_session: AsyncSession | None = None,
 ) -> None:
     """Remove a breach window from the database (alert fired or cleared).
 
+    Scoped by tenant_id to avoid cross-tenant deletion (H2).
     Accepts an optional pre-existing session for batch reuse (N4).
     """
     async with _session_scope(db_session) as session:
@@ -308,9 +371,10 @@ async def delete_breach_window_db(
                 AlertBreach.__table__.delete().where(
                     AlertBreach.rule_id == rule_id,
                     AlertBreach.node_id == node_id,
+                    AlertBreach.tenant_id == tenant_id,
                 )
             )
             await session.commit()
         except Exception:
             await session.rollback()
-            logger.exception("delete_breach_window_failed", rule_id=str(rule_id), node_id=str(node_id))
+            logger.exception("delete_breach_window_failed", rule_id=str(rule_id), node_id=str(node_id), tenant_id=tenant_id)

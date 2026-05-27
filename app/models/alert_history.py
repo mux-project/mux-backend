@@ -27,6 +27,9 @@ class AlertHistory(Base):
     metric_value: Mapped[float] = mapped_column(Float, nullable=False)
     message: Mapped[str | None] = mapped_column(Text)
     notified_channels: Mapped[dict | None] = mapped_column(JSONB)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=""
+    )
     triggered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

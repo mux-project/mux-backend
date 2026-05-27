@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.alerts.cache import rule_cache
 from app.alerts.state import StateManager
+from app.config import settings
 from app.core.logging import logger
 from app.database.session import async_session_factory
 from app.models.alert_breach import AlertBreach
@@ -35,10 +36,18 @@ async def rebuild_state_from_db(state: StateManager) -> int:
     if not rule_cache.is_loaded:
         await rule_cache.refresh()
 
-    # 3. Clear ALL alert state keys — both tenant-scoped and global (N1)
-    await _clear_all_state(state)
+    # 3. Clear ALL alert state keys — but only if we're the first worker
+    #    to recover (H1 — prevents race with running consumer during
+    #    overlapping restarts in multi-replica deployments).
+    recovery_lock_key = "alert:recovery:gen"
+    acquired = await state._r.set(recovery_lock_key, settings.ALERT_ENGINE_CONSUMER_NAME, nx=True, ex=300)
+    if acquired:
+        logger.info("recovery_clear_initiated", worker_id=settings.ALERT_ENGINE_CONSUMER_NAME)
+        await _clear_all_state(state)
+    else:
+        logger.info("recovery_clear_skipped_another_worker_active", worker_id=settings.ALERT_ENGINE_CONSUMER_NAME)
 
-    # 4. Load all firing alerts from DB
+    # 4. Load all firing alerts from DB and restore with tenant-scoped keys
     restored = 0
     async with async_session_factory() as session:
         result = await session.execute(
@@ -48,7 +57,7 @@ async def rebuild_state_from_db(state: StateManager) -> int:
         )
         firing_alerts = result.scalars().all()
 
-        for alert in firing_alerts:
+        for idx, alert in enumerate(firing_alerts):
             rule = rule_cache.get_by_id(alert.rule_id)
             rule_version = rule.version if rule else (alert.rule_version or 1)
             node_id = alert.node_id
@@ -59,7 +68,10 @@ async def rebuild_state_from_db(state: StateManager) -> int:
                 else alert.triggered_at.timestamp()
             )
 
-            await state.set_active_alert(
+            # Use tenant-scoped state so runtime evaluation finds the key (F1)
+            tenant = alert.tenant_id or ""
+            ts = StateManager(state._r, tenant=tenant)
+            await ts.set_active_alert(
                 rule_id=alert.rule_id,
                 node_id=node_id,
                 alert_history_id=alert.id,
@@ -79,11 +91,24 @@ async def rebuild_state_from_db(state: StateManager) -> int:
                 # Force-resolve: update DB
                 alert.status = "resolved"
                 # Don't restore in Redis — it gets resolved
-                await state.delete_active_alert(alert.rule_id, node_id)
+                await ts.delete_active_alert(alert.rule_id, node_id)
 
             restored += 1
 
-    # 5. Rebuild breach windows (duration tracking) from DB
+            # Refresh the recovery lock periodically to prevent expiry
+            # during long rebuilds at scale (F3).
+            if idx > 0 and idx % 1000 == 0:
+                await state._r.expire(recovery_lock_key, 300)
+
+        # C3: persist force-resolved orphaned alerts before session closes
+        await session.commit()
+
+    # 5. Clean up the recovery lock so a subsequent restart doesn't
+    #    wait for TTL expiry (F3).
+    if acquired:
+        await state._r.delete(recovery_lock_key)
+
+    # 6. Rebuild breach windows (duration tracking) from DB
     breach_count = await _rebuild_breach_windows(state)
 
     logger.info(
@@ -128,6 +153,8 @@ async def _rebuild_breach_windows(state: StateManager) -> int:
 
     Recreates Redis breach:* keys for duration-based rules whose
     breach window was interrupted by a worker restart.
+    Each key is scoped by tenant_id so that tenant-scoped evaluations
+    can find their own breach windows after recovery (H2).
     """
     restored = 0
     async with async_session_factory() as session:
@@ -136,7 +163,8 @@ async def _rebuild_breach_windows(state: StateManager) -> int:
 
         for row in rows:
             started_ts = row.started_at.replace(tzinfo=timezone.utc).timestamp()
-            await state.create_breach_window(row.rule_id, row.node_id, started_ts)
+            ts = StateManager(state._r, tenant=row.tenant_id)
+            await ts.create_breach_window(row.rule_id, row.node_id, started_ts)
             restored += 1
 
     if restored > 0:
