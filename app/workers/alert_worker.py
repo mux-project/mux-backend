@@ -32,6 +32,7 @@ from app.alerts.state import StateManager
 from app.config import settings
 from app.core.logging import configure_logging, logger
 from app.core.redis import close_redis, get_redis
+from app.database.session import async_session_factory
 
 
 def _parse_metric_fields(data: dict) -> list[tuple[str, float]]:
@@ -86,67 +87,64 @@ async def process_metric(
     parsed_node_id = uuid.UUID(node_id) if isinstance(node_id, str) else node_id
     collected_ts = _parse_collected_at(collected_at)
 
-    for metric_field, value in _parse_metric_fields(data):
-        rules = rule_cache.get_rules_for_field(metric_field)
-        if not rules:
-            continue
+    async with async_session_factory() as db_session:
+        for metric_field, value in _parse_metric_fields(data):
+            rules = rule_cache.get_rules_for_field(metric_field)
+            if not rules:
+                continue
 
-        for rule in rules:
-            try:
-                with metrics.alert_evaluation_duration.time():
-                    decision = await evaluate_metric(
-                        state=state,
-                        rule=rule,
-                        node_id=parsed_node_id,
-                        value=value,
-                        collected_at=collected_ts,
-                    )
-
-                action = decision.get("action")
-                metrics.alert_evaluations.labels(result=action).inc()
-
-                if action == "fire":
-                    # Clean up persisted breach window, then fire (includes notification dispatch)
-                    await delete_breach_window_db(rule.id, parsed_node_id)
-                    await fire_alert(
-                        state=state,
-                        rule=rule,
-                        node_id=parsed_node_id,
-                        value=value,
-                        tenant_id=tenant_id,
-                    )
-
-                elif action == "resolve":
-                    # Resolve active alert with optimistic lock
-                    active_alert = await state.get_active_alert(rule.id, parsed_node_id)
-                    if active_alert:
-                        await resolve_alert(
+            for rule in rules:
+                try:
+                    with metrics.alert_evaluation_duration.time():
+                        decision = await evaluate_metric(
                             state=state,
                             rule=rule,
                             node_id=parsed_node_id,
-                            active_alert=active_alert,
+                            value=value,
+                            collected_at=collected_ts,
                         )
 
-                elif action == "breach_start":
-                    # Persist the breach window start for crash recovery
-                    started_at = decision.get("started_at")
-                    if started_at:
-                        await persist_breach_window(rule.id, parsed_node_id, started_at)
+                    action = decision.get("action")
+                    metrics.alert_evaluations.labels(result=action).inc()
 
-                elif action == "breach_cleared":
-                    # Remove persisted breach window (condition resolved before firing)
-                    await delete_breach_window_db(rule.id, parsed_node_id)
+                    if action == "fire":
+                        await delete_breach_window_db(rule.id, parsed_node_id, db_session=db_session)
+                        await fire_alert(
+                            state=state,
+                            rule=rule,
+                            node_id=parsed_node_id,
+                            value=value,
+                            tenant_id=tenant_id,
+                        )
 
-            except Exception as exc:
-                logger.exception(
-                    "rule_evaluation_error",
-                    rule_id=str(rule.id),
-                    rule_name=rule.name,
-                    node_id=str(parsed_node_id),
-                    metric_field=metric_field,
-                    value=value,
-                    error=str(exc),
-                )
+                    elif action == "resolve":
+                        active_alert = await state.get_active_alert(rule.id, parsed_node_id)
+                        if active_alert:
+                            await resolve_alert(
+                                state=state,
+                                rule=rule,
+                                node_id=parsed_node_id,
+                                active_alert=active_alert,
+                            )
+
+                    elif action == "breach_start":
+                        started_at = decision.get("started_at")
+                        if started_at:
+                            await persist_breach_window(rule.id, parsed_node_id, started_at, db_session=db_session)
+
+                    elif action == "breach_cleared":
+                        await delete_breach_window_db(rule.id, parsed_node_id, db_session=db_session)
+
+                except Exception as exc:
+                    logger.exception(
+                        "rule_evaluation_error",
+                        rule_id=str(rule.id),
+                        rule_name=rule.name,
+                        node_id=str(parsed_node_id),
+                        metric_field=metric_field,
+                        value=value,
+                        error=str(exc),
+                    )
 
 
 async def _rule_cache_refresher(stop_event: asyncio.Event) -> None:

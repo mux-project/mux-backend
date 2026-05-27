@@ -8,6 +8,7 @@ Notification failures are logged and swallowed — they must NOT
 break the metric processing pipeline.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
@@ -16,6 +17,10 @@ from app.alerts.cache import CachedRule
 from app.alerts.notifiers.email import send_email_alert
 from app.alerts.notifiers.slack import send_slack_alert
 from app.core.logging import logger
+
+# Cap concurrent notification sends to avoid exhausting the event loop
+# under heavy alert load (N4).
+_notification_semaphore = asyncio.Semaphore(100)
 
 
 async def dispatch_notifications(
@@ -74,26 +79,28 @@ async def dispatch_notifications(
             if channel_type == "email":
                 recipient = channel.get("recipient", "")
                 if recipient:
-                    with metrics.alert_notification_duration.labels(channel="email").time():
-                        ok = await send_email_alert(recipient, subject, body)
+                    async with _notification_semaphore:
+                        with metrics.alert_notification_duration.labels(channel="email").time():
+                            ok = await send_email_alert(recipient, subject, body)
                     if ok:
                         notified.append(f"email:{recipient}")
                     metrics.alert_notifications.labels(channel="email", result="ok" if ok else "fail").inc()
 
             elif channel_type == "slack":
                 webhook = channel.get("webhook_url", "")
-                with metrics.alert_notification_duration.labels(channel="slack").time():
-                    ok = await send_slack_alert(
-                    webhook_url=webhook,
-                    message=subject,
-                    title=title,
-                    rule_name=rule.name,
-                    metric_field=rule.metric_field,
-                    value=value,
-                    threshold=rule.threshold,
-                    operator=rule.operator,
-                    timestamp=timestamp,
-                )
+                async with _notification_semaphore:
+                    with metrics.alert_notification_duration.labels(channel="slack").time():
+                        ok = await send_slack_alert(
+                        webhook_url=webhook,
+                        message=subject,
+                        title=title,
+                        rule_name=rule.name,
+                        metric_field=rule.metric_field,
+                        value=value,
+                        threshold=rule.threshold,
+                        operator=rule.operator,
+                        timestamp=timestamp,
+                    )
                 if ok:
                     notified.append("slack")
                 metrics.alert_notifications.labels(channel="slack", result="ok" if ok else "fail").inc()

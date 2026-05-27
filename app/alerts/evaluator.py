@@ -75,61 +75,61 @@ async def evaluate_metric(
     # 2. Evaluate threshold
     breached = threshold_breached(rule.operator, value, rule.threshold)
 
-    # 3. Check current state
-    active_alert = await state.get_active_alert(rule.id, node_id)
-    in_cooldown = await state.is_in_cooldown(rule.id, node_id)
-    breach_start = await state.get_breach_window(rule.id, node_id)
+    # 3. Acquire distributed lock for this (rule, node) — prevents race
+    #    between concurrent workers on breach windows and fire decisions (N2).
+    token = await state.acquire_lock(rule.id, node_id)
+    if token is None:
+        return decision
 
-    if breached:
-        if active_alert:
-            # Already firing — check if re-notification is needed
-            # (handled by re-notify loop, not here)
-            return {"action": "none", "value": value}
+    try:
+        # 4. Check current state (under lock)
+        active_alert = await state.get_active_alert(rule.id, node_id)
+        in_cooldown = await state.is_in_cooldown(rule.id, node_id)
+        breach_start = await state.get_breach_window(rule.id, node_id)
 
-        if in_cooldown:
-            # In cooldown — suppress
-            return {"action": "none", "value": value}
+        if breached:
+            if active_alert:
+                return {"action": "none", "value": value}
 
-        if breach_start is None:
-            # First breach — start duration window
-            redis_now = await state.redis_time()
-            await state.create_breach_window(rule.id, node_id, redis_now)
+            if in_cooldown:
+                return {"action": "none", "value": value}
+
+            if breach_start is None:
+                redis_now = await state.redis_time()
+                await state.create_breach_window(rule.id, node_id, redis_now)
+                return {
+                    "action": "breach_start",
+                    "started_at": redis_now,
+                    "value": value,
+                    "duration_seconds": rule.duration_seconds,
+                }
+
+            elapsed = (await state.redis_time()) - breach_start
+            if elapsed >= rule.duration_seconds:
+                await state.delete_breach_window(rule.id, node_id)
+                return {
+                    "action": "fire",
+                    "value": value,
+                    "breach_duration": elapsed,
+                    "fired_at": breach_start,
+                }
+
             return {
-                "action": "breach_start",
-                "started_at": redis_now,
-                "value": value,
+                "action": "breach_continue",
+                "elapsed": elapsed,
                 "duration_seconds": rule.duration_seconds,
-            }
-
-        # Already in breach window — check if duration elapsed
-        elapsed = (await state.redis_time()) - breach_start
-        if elapsed >= rule.duration_seconds:
-            # Duration met — time to fire
-            await state.delete_breach_window(rule.id, node_id)
-            return {
-                "action": "fire",
                 "value": value,
-                "breach_duration": elapsed,
-                "fired_at": breach_start,
             }
 
-        # Still in breach window, waiting for duration
-        return {
-            "action": "breach_continue",
-            "elapsed": elapsed,
-            "duration_seconds": rule.duration_seconds,
-            "value": value,
-        }
+        else:
+            if breach_start is not None:
+                await state.delete_breach_window(rule.id, node_id)
+                return {"action": "breach_cleared", "breach_duration": (await state.redis_time()) - breach_start}
 
-    else:
-        # Not breached
-        if breach_start is not None:
-            # Clear breach window (condition resolved before duration met)
-            await state.delete_breach_window(rule.id, node_id)
-            return {"action": "breach_cleared", "breach_duration": (await state.redis_time()) - breach_start}
+            if active_alert:
+                return {"action": "resolve", "value": value}
 
-        if active_alert:
-            # Condition cleared while alert was firing → resolve
-            return {"action": "resolve", "value": value}
+            return {"action": "none"}
 
-        return {"action": "none"}
+    finally:
+        await state.release_lock(rule.id, node_id, token)

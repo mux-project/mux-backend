@@ -8,6 +8,7 @@ Handles all alert_history INSERT/UPDATE operations with:
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
@@ -22,6 +23,16 @@ from app.core.logging import logger
 from app.database.session import async_session_factory
 from app.models.alert_breach import AlertBreach
 from app.models.alert_history import AlertHistory
+
+
+@asynccontextmanager
+async def _session_scope(db_session: AsyncSession | None):
+    """Yield the caller-provided session, or create + close a new one (N4)."""
+    if db_session is not None:
+        yield db_session
+    else:
+        async with async_session_factory() as s:
+            yield s
 
 
 async def fire_alert(
@@ -255,14 +266,18 @@ async def _rebuild_active_from_db(
 
 
 async def persist_breach_window(
-    rule_id: uuid.UUID, node_id: uuid.UUID, started_at: float
+    rule_id: uuid.UUID,
+    node_id: uuid.UUID,
+    started_at: float,
+    db_session: AsyncSession | None = None,
 ) -> None:
     """Persist a breach window to the database for crash recovery.
 
     Uses PostgreSQL ON CONFLICT (rule_id, node_id) DO NOTHING
     to handle concurrent upserts safely.
+    Accepts an optional pre-existing session for batch reuse (N4).
     """
-    async with async_session_factory() as session:
+    async with _session_scope(db_session) as session:
         try:
             await session.execute(
                 AlertBreach.__table__.insert().on_conflict_do_nothing(
@@ -278,9 +293,16 @@ async def persist_breach_window(
             logger.exception("persist_breach_window_failed", rule_id=str(rule_id), node_id=str(node_id))
 
 
-async def delete_breach_window_db(rule_id: uuid.UUID, node_id: uuid.UUID) -> None:
-    """Remove a breach window from the database (alert fired or cleared)."""
-    async with async_session_factory() as session:
+async def delete_breach_window_db(
+    rule_id: uuid.UUID,
+    node_id: uuid.UUID,
+    db_session: AsyncSession | None = None,
+) -> None:
+    """Remove a breach window from the database (alert fired or cleared).
+
+    Accepts an optional pre-existing session for batch reuse (N4).
+    """
+    async with _session_scope(db_session) as session:
         try:
             await session.execute(
                 AlertBreach.__table__.delete().where(
